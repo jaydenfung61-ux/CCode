@@ -149,11 +149,12 @@ alertcondition(confirmUp,   title = "Exhaustion Gap - Bearish", message = "Beari
 alertcondition(confirmDown, title = "Exhaustion Gap - Bullish", message = "Bullish exhaustion gap confirmed: mature downtrend, climactic gap down, momentum stall, and gap filled.")
 
 // ----------------------------------------------------------------------------- Status table (live objective checklist)
+f_yn(bool b) => b ? "✔" : "—"
+
 var table panel = table.new(position.top_right, 2, 5, border_width = 1)
 if barstate.islast
     activeUp   = countUp   > 0
     activeDown = countDown > 0
-    f_yn(b)    => b ? "✔" : "—"
     table.cell(panel, 0, 0, "Exhaustion Gap", text_color = color.white, bgcolor = color.new(color.gray, 0))
     table.cell(panel, 1, 0, (activeUp ? "UP gap" : activeDown ? "DOWN gap" : "idle"), text_color = color.white, bgcolor = color.new(color.gray, 0))
     table.cell(panel, 0, 1, "1 Capitulation", text_color = color.white)
