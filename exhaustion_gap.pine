@@ -1,0 +1,166 @@
+//@version=5
+// =============================================================================
+// Exhaustion Gap Indicator
+// -----------------------------------------------------------------------------
+// An exhaustion gap appears NEAR THE END of a mature trend and, unlike a
+// breakaway or continuation gap, signals that the trend is running out of fuel.
+// This script qualifies a gap through four sequential objectives:
+//
+//   1. Climate of Capitulation        -> a real gap on climactic (spike) volume
+//   2. Context Objective              -> the trend is MATURE / extended
+//   3. Stall Objective                -> immediate momentum loss (no follow-through)
+//   4. Confirmation Objective         -> structural failure (the gap gets filled)
+//
+// A signal only prints when all four are satisfied within a short window,
+// which keeps it from firing on breakaway gaps at the start of a move.
+// =============================================================================
+
+indicator("Exhaustion Gap Detector", overlay = true, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------- Inputs
+grpGap   = "1. Climate of Capitulation (the gap)"
+gapPct   = input.float(0.5,  "Min gap size (% of price)",      minval = 0.0, step = 0.1, group = grpGap,
+     tooltip = "Minimum overnight gap, measured as a % of price, to qualify as a real gap.")
+volMult  = input.float(2.0,  "Capitulation volume x avg",      minval = 1.0, step = 0.1, group = grpGap,
+     tooltip = "Gap volume must exceed this multiple of its moving average to count as climactic/capitulation.")
+volLen   = input.int(20,     "Volume average length",          minval = 1,   group = grpGap)
+
+grpCtx   = "2. Context Objective (trend maturity)"
+trendLen = input.int(50,     "Trend MA length",                minval = 2,   group = grpCtx)
+runLen   = input.int(8,      "Min mature-trend run (bars)",    minval = 2,   group = grpCtx,
+     tooltip = "Number of recent bars the trend must already have been intact for the move to be 'mature'.")
+stretch  = input.float(3.0,  "Min stretch from MA (ATR mult)", minval = 0.0, step = 0.1, group = grpCtx,
+     tooltip = "Price must be at least this many ATR away from the trend MA, i.e. the move is extended/exhausted.")
+
+grpStall = "3. Stall Objective (momentum loss)"
+rsiLen   = input.int(14,     "RSI length",                     minval = 1,   group = grpStall)
+wickFrac = input.float(0.4,  "Min rejection wick (frac of range)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpStall,
+     tooltip = "Fraction of the gap bar's range that must be a wick into the gap (failure to hold the extreme).")
+
+grpConf  = "4. Confirmation Objective (structural failure)"
+fillBars = input.int(3,      "Bars allowed to fill the gap",   minval = 1,   group = grpConf,
+     tooltip = "How many bars after the gap price has to close back through the gap level to confirm.")
+
+grpViz   = "Visuals"
+showStages = input.bool(true, "Show stage markers (1/2/3)", group = grpViz)
+showZone   = input.bool(true, "Draw the gap zone",          group = grpViz)
+
+// ----------------------------------------------------------------------------- Core series
+atr     = ta.atr(14)
+ma      = ta.sma(close, trendLen)
+volAvg  = ta.sma(volume, volLen)
+rsi     = ta.rsi(close, rsiLen)
+
+barRange = high - low
+isClimax = volume > volAvg * volMult           // capitulation / climactic volume
+
+// ----------------------------------------------------------------------------- Trend direction & maturity (Context)
+upTrend   = close > ma and ma > ma[runLen]
+downTrend = close < ma and ma < ma[runLen]
+
+// Mature = the directional run has persisted for runLen bars AND price is stretched far from the MA.
+matureUp   = upTrend   and close > close[runLen] and (close - ma) >  stretch * atr
+matureDown = downTrend and close < close[runLen] and (ma - close) >  stretch * atr
+
+// ----------------------------------------------------------------------------- 1. The Gap + Capitulation
+// Exhaustion gap runs WITH the mature trend: gap UP in an uptrend, gap DOWN in a downtrend.
+gapUpSize   = (low  - high[1]) / high[1] * 100.0
+gapDownSize = (low[1] - high) / low[1]  * 100.0
+
+gapUp   = low  > high[1] and gapUpSize   >= gapPct
+gapDown = high < low[1]  and gapDownSize >= gapPct
+
+climaxGapUp   = gapUp   and isClimax and matureUp
+climaxGapDown = gapDown and isClimax and matureDown
+
+// ----------------------------------------------------------------------------- 2. Stall on the gap bar (momentum loss)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+// Uptrend exhaustion: long upper wick = sellers rejecting the highs; RSI rolling over from overbought.
+stallUp   = barRange > 0 and (upperWick / barRange) >= wickFrac and rsi < rsi[1] and rsi[1] > 65
+// Downtrend exhaustion: long lower wick = buyers rejecting the lows; RSI turning up from oversold.
+stallDown = barRange > 0 and (lowerWick / barRange) >= wickFrac and rsi > rsi[1] and rsi[1] < 35
+
+// A qualified gap bar = climactic exhaustion gap that also stalls immediately.
+qualUp   = climaxGapUp   and stallUp
+qualDown = climaxGapDown and stallDown
+
+// ----------------------------------------------------------------------------- 3. Track the gap & confirm structural failure
+// Persist the gap level and a countdown after a qualified gap bar.
+var float gapLevelUp   = na   // bottom of an up gap  (= prior high). Fill = close back below it.
+var float gapLevelDown = na   // top of a down gap    (= prior low).  Fill = close back above it.
+var int   countUp      = 0
+var int   countDown    = 0
+var int   gapBarUp     = na
+var int   gapBarDown   = na
+
+if qualUp
+    gapLevelUp := high[1]
+    countUp    := fillBars
+    gapBarUp   := bar_index
+if qualDown
+    gapLevelDown := low[1]
+    countDown    := fillBars
+    gapBarDown   := bar_index
+
+// Confirmation = gap is filled within the window (structural failure of the trend).
+confirmUp   = false
+confirmDown = false
+
+if countUp > 0 and not qualUp
+    if close < gapLevelUp
+        confirmUp := true
+        countUp   := 0
+    else
+        countUp := countUp - 1
+        if countUp == 0
+            gapLevelUp := na
+
+if countDown > 0 and not qualDown
+    if close > gapLevelDown
+        confirmDown := true
+        countDown   := 0
+    else
+        countDown := countDown - 1
+        if countDown == 0
+            gapLevelDown := na
+
+// ----------------------------------------------------------------------------- Plots
+// Stage markers
+plotshape(showStages and qualUp,   title = "Exhaustion gap up (stalled)",   style = shape.triangledown, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny,  text = "gap")
+plotshape(showStages and qualDown, title = "Exhaustion gap down (stalled)", style = shape.triangleup,   location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny,  text = "gap")
+
+// Confirmed signals (all four objectives met)
+plotshape(confirmUp,   title = "BEARISH exhaustion confirmed", style = shape.labeldown, location = location.abovebar, color = color.new(color.red,  0),  textcolor = color.white, size = size.small, text = "EXH ↓")
+plotshape(confirmDown, title = "BULLISH exhaustion confirmed", style = shape.labelup,   location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, text = "EXH ↑")
+
+// Gap zone visualization
+if showZone and qualUp
+    box.new(left = bar_index - 1, top = low, right = bar_index + fillBars, bottom = high[1], border_color = color.new(color.orange, 50), bgcolor = color.new(color.orange, 85))
+if showZone and qualDown
+    box.new(left = bar_index - 1, top = low[1], right = bar_index + fillBars, bottom = high, border_color = color.new(color.orange, 50), bgcolor = color.new(color.orange, 85))
+
+bgcolor(confirmUp   ? color.new(color.red,   88) : na, title = "Bearish confirm bg")
+bgcolor(confirmDown ? color.new(color.green, 88) : na, title = "Bullish confirm bg")
+
+// ----------------------------------------------------------------------------- Alerts
+alertcondition(confirmUp,   title = "Exhaustion Gap - Bearish", message = "Bearish exhaustion gap confirmed: mature uptrend, climactic gap up, momentum stall, and gap filled.")
+alertcondition(confirmDown, title = "Exhaustion Gap - Bullish", message = "Bullish exhaustion gap confirmed: mature downtrend, climactic gap down, momentum stall, and gap filled.")
+
+// ----------------------------------------------------------------------------- Status table (live objective checklist)
+var table panel = table.new(position.top_right, 2, 5, border_width = 1)
+if barstate.islast
+    activeUp   = countUp   > 0
+    activeDown = countDown > 0
+    f_yn(b)    => b ? "✔" : "—"
+    table.cell(panel, 0, 0, "Exhaustion Gap", text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(panel, 1, 0, (activeUp ? "UP gap" : activeDown ? "DOWN gap" : "idle"), text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(panel, 0, 1, "1 Capitulation", text_color = color.white)
+    table.cell(panel, 1, 1, f_yn(isClimax),   text_color = color.white)
+    table.cell(panel, 0, 2, "2 Context (mature)", text_color = color.white)
+    table.cell(panel, 1, 2, f_yn(matureUp or matureDown), text_color = color.white)
+    table.cell(panel, 0, 3, "3 Stall", text_color = color.white)
+    table.cell(panel, 1, 3, f_yn(stallUp or stallDown), text_color = color.white)
+    table.cell(panel, 0, 4, "4 Confirmation", text_color = color.white)
+    table.cell(panel, 1, 4, f_yn(activeUp or activeDown), text_color = color.white)
