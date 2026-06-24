@@ -1,0 +1,84 @@
+//@version=6
+// =============================================================================
+// LinReg T5 RSI Exit — DAYTRADING variant
+// -----------------------------------------------------------------------------
+// Intraday adaptation of the daily "LinReg T5 RSI Exit" mean-reversion strategy.
+// Same core idea: buy a dip below the short-term linear-regression "fair value"
+// while the longer trend is intact, exit when momentum gets overbought.
+//
+// What changed for intraday use:
+//   1. Session control      -> only enter during a defined trading window
+//   2. EOD flatten          -> always flat by the session close (no overnight)
+//   3. Trend anchor toggle   -> VWAP (intraday-native) or SMA200, your choice
+//   4. ATR protective stop   -> hard stop the daily version lacked
+//   5. Costs wired in        -> commission + slippage (decisive intraday)
+//   6. Entry guard           -> no same-bar overbought re-entry churn
+// =============================================================================
+
+strategy("LinReg T5 RSI Exit — Daytrade", overlay=true,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 100,
+     initial_capital    = 5000,
+     commission_type    = strategy.commission.cash_per_order,
+     commission_value   = 1.0,
+     slippage           = 2,
+     pyramiding         = 0,
+     close_entries_rule = "ANY")
+
+// ----------------------------------------------------------------------------- Inputs
+i_length   = input.int(14, "Regression Length", minval=1, group="Signals")
+i_rsiLen   = input.int(14, "RSI Length",        minval=1, group="Signals")
+i_rsiOB    = input.int(65, "RSI Overbought Exit", minval=50, maxval=100, group="Signals")
+
+i_anchor   = input.string("VWAP", "Trend Anchor", options=["VWAP", "SMA200"],
+     tooltip="VWAP is the natural intraday 'fair value' reference; SMA200 mirrors the daily strategy.",
+     group="Trend Filter")
+i_smaLen   = input.int(200, "SMA Length (if SMA200 anchor)", minval=1, group="Trend Filter")
+
+i_session  = input.session("0930-1545", "Trading Session (entries allowed)", group="Session")
+i_eodExit  = input.session("1545-1600", "Flatten Window (force exit)",       group="Session")
+
+i_useStop  = input.bool(true, "Use ATR Stop", group="Risk")
+i_atrLen   = input.int(14,  "ATR Length",  minval=1, group="Risk")
+i_atrMult  = input.float(2.0, "ATR Stop Multiplier", minval=0.1, step=0.1, group="Risk")
+
+// ----------------------------------------------------------------------------- Indicators
+linreg = ta.linreg(close, i_length, 0)
+rsi    = ta.rsi(close, i_rsiLen)
+atr    = ta.atr(i_atrLen)
+
+// Trend anchor: VWAP resets each session automatically; SMA200 rolls across bars.
+vwap   = ta.vwap(hlc3)
+sma    = ta.sma(close, i_smaLen)
+anchor = i_anchor == "VWAP" ? vwap : sma
+
+// ----------------------------------------------------------------------------- Session state
+inSession = not na(time(timeframe.period, i_session))
+inEOD     = not na(time(timeframe.period, i_eodExit))
+
+// ----------------------------------------------------------------------------- Entry / Exit logic
+// Dip below short-term regression, but overall (intraday) trend still up,
+// inside the session, and not already overbought (guards same-bar churn).
+longSetup = close < linreg and close > anchor and rsi < i_rsiOB
+canEnter  = inSession and not inEOD
+
+if longSetup and canEnter
+    strategy.entry("Long", strategy.long)
+
+// Momentum exit
+if rsi > i_rsiOB
+    strategy.close("Long", comment="RSI OB")
+
+// Protective ATR stop (anchored to entry price)
+if i_useStop and strategy.position_size > 0
+    stopPrice = strategy.position_avg_price - i_atrMult * atr
+    strategy.exit("Long Stop", from_entry="Long", stop=stopPrice)
+
+// End-of-day flatten — always flat before the close, no overnight risk
+if inEOD
+    strategy.close("Long", comment="EOD flat")
+
+// ----------------------------------------------------------------------------- Plots
+plot(linreg, "Linear Regression", color=color.rgb(222, 240, 255), linewidth=2)
+plot(anchor, "Trend Anchor", color=color.new(color.orange, 0), linewidth=1)
+bgcolor(inSession ? color.new(color.teal, 92) : na, title="Session")
