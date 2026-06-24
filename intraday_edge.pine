@@ -1,0 +1,176 @@
+//@version=5
+// =============================================================================
+// Intraday Edge — a low-lag, state-aware, volume-confirmed signal engine
+// -----------------------------------------------------------------------------
+// Built around five pillars of a usable intraday tool:
+//
+//   1. Zero-Lag Responsiveness   -> VWAP + EMA (no SMA, no high lookback),
+//                                   and NO REPAINTING (every input is confirmed
+//                                   on close; nothing is recomputed in the past).
+//   2. Market-State Adaptability -> an ADX/ATR regime gate separates TREND from
+//                                   CHOP and *widens* trigger thresholds in chop,
+//                                   *narrows* them in clean trends.
+//   3. Traffic-Light Rules       -> one objective state at all times:
+//                                   GREEN (long), RED (short), or GREY (sit out).
+//   4. Volume-Weighted Confluence-> signals require relative-volume thrust AND a
+//                                   volume-delta proxy that agrees with direction,
+//                                   so it is not just an echo of price/RSI.
+//   5. Risk Management            -> every trigger plots an ATR stop, an R-based
+//                                   target at the chosen RRR, and computes a
+//                                   position size from account size & risk %.
+//
+// Non-repainting note: all logic uses confirmed values (no `request.security`
+// with lookahead, no future references). Signals are evaluated on bar close and
+// therefore do not change once the bar is closed.
+// =============================================================================
+
+indicator("Intraday Edge", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ----------------------------------------------------------------------------- 1. Timing / trend engine
+grpT     = "1. Timing (low-lag engine)"
+emaFast  = input.int(9,   "Fast EMA",        minval = 1, group = grpT)
+emaSlow  = input.int(21,  "Slow EMA",        minval = 2, group = grpT)
+useVwap  = input.bool(true, "Require price on VWAP side", group = grpT,
+     tooltip = "Longs only above the session VWAP, shorts only below it. VWAP resets each session — a true intraday anchor.")
+
+// ----------------------------------------------------------------------------- 2. Market-state (trend vs chop)
+grpS     = "2. Market state (adaptive)"
+adxLen   = input.int(14,  "ADX/DI length",   minval = 1, group = grpS)
+adxTrend = input.float(20.0, "ADX trend threshold", minval = 0, step = 0.5, group = grpS,
+     tooltip = "Above this = trending regime (tight triggers). Below = chop regime (wide triggers / fewer trades).")
+atrLen   = input.int(14,  "ATR length",      minval = 1, group = grpS)
+chopMult = input.float(1.5, "Chop trigger widen (x)", minval = 1.0, step = 0.1, group = grpS,
+     tooltip = "In a chop regime the momentum/break thresholds are multiplied by this so only stronger thrusts trade.")
+
+// ----------------------------------------------------------------------------- 3. Volume confluence
+grpV     = "3. Volume confluence"
+volLen   = input.int(20,  "Relative-volume length", minval = 1, group = grpV)
+volThr   = input.float(1.3, "Min relative volume (x avg)", minval = 0.0, step = 0.1, group = grpV,
+     tooltip = "Bar volume must exceed this multiple of its average — real participation, not a drift.")
+
+// ----------------------------------------------------------------------------- 4. Momentum trigger
+grpM     = "4. Momentum trigger"
+momLen   = input.int(7,   "Momentum (ROC) length", minval = 1, group = grpM)
+momThr   = input.float(0.05, "Base momentum threshold (%)", minval = 0.0, step = 0.01, group = grpM,
+     tooltip = "Minimum % thrust to arm a signal in a TREND regime; widened by the chop multiplier in chop.")
+
+// ----------------------------------------------------------------------------- 5. Risk management
+grpR     = "5. Risk management"
+stopAtr  = input.float(1.5, "Stop distance (ATR x)", minval = 0.1, step = 0.1, group = grpR)
+rrr      = input.float(2.0, "Reward : Risk",         minval = 0.1, step = 0.1, group = grpR)
+acctSize = input.float(25000, "Account size ($)",    minval = 0,   step = 500, group = grpR)
+riskPct  = input.float(1.0, "Risk per trade (%)",    minval = 0.0, maxval = 100, step = 0.1, group = grpR,
+     tooltip = "Position size is derived so that a stop-out loses this % of the account.")
+
+grpViz   = "Visuals"
+showLevels = input.bool(true, "Plot stop / target levels", group = grpViz)
+showPanel  = input.bool(true, "Show dashboard",            group = grpViz)
+
+// ----------------------------------------------------------------------------- Core series (all low-lag / confirmed)
+ef   = ta.ema(close, emaFast)
+es   = ta.ema(close, emaSlow)
+vwap = ta.vwap(hlc3)
+atr  = ta.atr(atrLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+volAvg = ta.sma(volume, volLen)
+relVol = volAvg > 0 ? volume / volAvg : 0.0
+mom    = ta.roc(close, momLen)            // % change — independent of RSI/MACD smoothing
+
+// Volume-delta proxy: where the bar closed within its range, scaled by volume.
+// Positive = buyers in control, negative = sellers. NOT an echo of price ROC.
+barRange = high - low
+clv      = barRange > 0 ? ((close - low) - (high - close)) / barRange : 0.0   // -1..+1
+volDelta = clv * relVol
+
+// ----------------------------------------------------------------------------- 2. Regime + adaptive threshold
+trending = adx >= adxTrend
+// Tight thresholds when trending, widened when chopping.
+momGate  = trending ? momThr : momThr * chopMult
+volGate  = trending ? volThr : volThr * chopMult
+
+// ----------------------------------------------------------------------------- Directional conditions
+trendUp   = ef > es and (not useVwap or close > vwap)
+trendDown = ef < es and (not useVwap or close < vwap)
+
+momUp   = mom >=  momGate
+momDown = mom <= -momGate
+
+volOk   = relVol >= volGate
+deltaUp = volDelta >  0
+deltaDn = volDelta <  0
+
+// ----------------------------------------------------------------------------- 3. Traffic-light state (one state per bar)
+rawLong  = trendUp   and momUp   and volOk and deltaUp
+rawShort = trendDown and momDown and volOk and deltaDn
+
+// Fire the signal only on the bar a state is freshly entered (clean, de-duplicated triggers).
+var int state = 0                  // 1 = green/long, -1 = red/short, 0 = grey/flat
+prevState = state
+state := rawLong ? 1 : rawShort ? -1 : (trending ? state : 0)   // in chop, decay to flat
+
+longSignal  = state ==  1 and prevState !=  1
+shortSignal = state == -1 and prevState != -1
+
+// ----------------------------------------------------------------------------- 5. Risk levels & position sizing
+var float entry  = na
+var float stop   = na
+var float target = na
+var float qty    = na
+
+if longSignal
+    entry  := close
+    stop   := close - stopAtr * atr
+    target := close + stopAtr * atr * rrr
+    riskPerShare = entry - stop
+    qty    := riskPerShare > 0 ? math.floor((acctSize * riskPct / 100.0) / riskPerShare) : na
+if shortSignal
+    entry  := close
+    stop   := close + stopAtr * atr
+    target := close - stopAtr * atr * rrr
+    riskPerShare = stop - entry
+    qty    := riskPerShare > 0 ? math.floor((acctSize * riskPct / 100.0) / riskPerShare) : na
+
+// ----------------------------------------------------------------------------- Plots
+plot(ef,   "Fast EMA", color = color.new(color.aqua,   0), linewidth = 1)
+plot(es,   "Slow EMA", color = color.new(color.orange, 0), linewidth = 1)
+plot(vwap, "VWAP",     color = color.new(color.fuchsia, 0), linewidth = 2)
+
+bgcolor(state == 1 ? color.new(color.green, 90) : state == -1 ? color.new(color.red, 90) : na, title = "Regime tint")
+
+plotshape(longSignal,  title = "LONG",  style = shape.labelup,   location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, text = "BUY")
+plotshape(shortSignal, title = "SHORT", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),   textcolor = color.white, size = size.small, text = "SELL")
+
+// Objective stop / target lines for the most recent trigger
+if showLevels and (longSignal or shortSignal)
+    line.new(bar_index, stop,   bar_index + 12, stop,   color = color.new(color.red, 0),   width = 1, style = line.style_dashed)
+    line.new(bar_index, target, bar_index + 12, target, color = color.new(color.green, 0), width = 1, style = line.style_dashed)
+    line.new(bar_index, entry,  bar_index + 12, entry,  color = color.new(color.gray, 0),  width = 1)
+
+// ----------------------------------------------------------------------------- Alerts
+alertcondition(longSignal,  title = "Intraday Edge - LONG",  message = "Intraday Edge LONG: trend up, momentum thrust, volume confluence. Stop & target plotted.")
+alertcondition(shortSignal, title = "Intraday Edge - SHORT", message = "Intraday Edge SHORT: trend down, momentum thrust, volume confluence. Stop & target plotted.")
+
+// ----------------------------------------------------------------------------- Dashboard
+f_yn(bool b) => b ? "✔" : "—"
+
+var table panel = table.new(position.top_right, 2, 8, border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+if showPanel and barstate.islast
+    lightTxt = state == 1 ? "🟢 LONG" : state == -1 ? "🔴 SHORT" : "⚪ SIT OUT"
+    lightCol = state == 1 ? color.new(color.green, 0) : state == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+    table.cell(panel, 0, 0, "Intraday Edge", text_color = color.white, bgcolor = color.new(color.black, 0))
+    table.cell(panel, 1, 0, lightTxt,        text_color = color.white, bgcolor = lightCol)
+    table.cell(panel, 0, 1, "Regime",        text_color = color.white)
+    table.cell(panel, 1, 1, trending ? "TREND (tight)" : "CHOP (wide)", text_color = color.white)
+    table.cell(panel, 0, 2, "ADX",           text_color = color.white)
+    table.cell(panel, 1, 2, str.tostring(adx, "#.0"), text_color = color.white)
+    table.cell(panel, 0, 3, "Rel volume",    text_color = color.white)
+    table.cell(panel, 1, 3, str.tostring(relVol, "#.00") + "x " + f_yn(volOk), text_color = color.white)
+    table.cell(panel, 0, 4, "Vol delta",     text_color = color.white)
+    table.cell(panel, 1, 4, str.tostring(volDelta, "#.00"), text_color = color.white)
+    table.cell(panel, 0, 5, "Stop / Target", text_color = color.white)
+    table.cell(panel, 1, 5, na(stop) ? "—" : str.tostring(stop, format.mintick) + " / " + str.tostring(target, format.mintick), text_color = color.white)
+    table.cell(panel, 0, 6, "Position size", text_color = color.white)
+    table.cell(panel, 1, 6, na(qty) ? "—" : str.tostring(qty, "#") + " sh", text_color = color.white)
+    table.cell(panel, 0, 7, "RRR",           text_color = color.white)
+    table.cell(panel, 1, 7, "1 : " + str.tostring(rrr, "#.0"), text_color = color.white)
